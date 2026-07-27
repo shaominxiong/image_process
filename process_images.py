@@ -71,6 +71,10 @@ DEFAULT_ORIENTATION = "horizontal"
 # Where each stripe sits relative to the ring gap it belongs to.
 STRIPE_POSITIONS = ("centred", "outer", "beyond")
 DEFAULT_STRIPE_POSITION = "outer"
+# Which ring the stripes are positioned against. "inner" allows frames where the
+# outer ring is missing or too faint to detect; scale then comes from r_inner.
+STRIPE_REFERENCES = ("outer", "inner")
+DEFAULT_STRIPE_REFERENCE = "outer"
 # Clearance in px between a stripe edge and the nearest mark's measured arm tip.
 DEFAULT_MARK_CLEARANCE = 20.0
 # Extra outward shift in px applied to both stripes, away from the pattern centre.
@@ -149,6 +153,7 @@ def stripe_rois(
     position: str = DEFAULT_STRIPE_POSITION,
     mark_clearance: float = DEFAULT_MARK_CLEARANCE,
     offset: float = DEFAULT_STRIPE_OFFSET,
+    reference: str = DEFAULT_STRIPE_REFERENCE,
 ) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]:
     """Two stripes placed relative to the inner/outer ring gaps.
 
@@ -156,54 +161,68 @@ def stripe_rois(
     second on the bottom). Vertical stripes are the same construction rotated 90
     degrees: they span y and sit on the left and right sides.
 
-    ``position`` sets where each stripe sits across the gap. All three keep
-    ``mark_clearance`` px between the stripe and the nearest mark's *measured* arm
-    tip, so none of them overlaps a mark:
+    ``position`` sets where each stripe sits relative to the reference ring. All
+    keep ``mark_clearance`` px between the stripe and the nearest mark's *measured*
+    arm tip, so none of them overlaps a mark:
 
-    * ``centred`` -- midway between the inner and outer mark pairs.
-    * ``outer``   -- pushed outward inside the gap, up against the outer marks.
-    * ``beyond``  -- outside the outer ring entirely, just past the outer marks.
+    * ``centred`` -- midway between the inner and outer mark pairs (needs both rings).
+    * ``outer``   -- pushed inward from the reference marks, up against them.
+    * ``beyond``  -- outside the reference ring entirely, just past its marks.
+
+    ``reference`` chooses which ring the stripes are placed against, and which
+    radius sets the stripe length. ``"inner"`` lets frames with a missing or too
+    faint outer ring still be measured -- but the stripes then sit at a different
+    distance from the pattern centre, so such results are NOT comparable with
+    outer-referenced ones.
 
     ``offset`` then nudges both stripes further outward (away from the pattern
     centre) by that many pixels, for fine positioning on top of any mode.
 
-    ``length_factor`` is the long dimension in outer-circle *diameters*;
+    ``length_factor`` is the long dimension in reference-circle *diameters*;
     ``thickness`` is the short dimension in pixels.
     """
-    if not detection.found:
-        raise ValueError("both fiducial rings are required to place the stripes")
     if orientation not in ORIENTATIONS:
         raise ValueError(f"orientation must be one of {ORIENTATIONS}, got {orientation!r}")
     if position not in STRIPE_POSITIONS:
         raise ValueError(f"position must be one of {STRIPE_POSITIONS}, got {position!r}")
+    if reference not in STRIPE_REFERENCES:
+        raise ValueError(f"reference must be one of {STRIPE_REFERENCES}, got {reference!r}")
+    if len(detection.inner_marks) != 4:
+        raise ValueError("the inner fiducial ring is required to place the stripes")
+    if reference == "outer" and len(detection.outer_marks) != 4:
+        raise ValueError("outer-referenced stripes need the outer ring; retry with reference='inner'")
+    if position == "centred" and len(detection.outer_marks) != 4:
+        raise ValueError("the 'centred' position needs both rings")
 
     # Gaps are measured across the stripes' short axis.
     gap_axis = "y" if orientation == "horizontal" else "x"
-    inner_low, inner_high = detection.edge("inner", gap_axis)
-    outer_low, outer_high = detection.edge("outer", gap_axis)
     half_thickness = thickness / 2.0
 
     if position == "centred":
+        inner_low, inner_high = detection.edge("inner", gap_axis)
+        outer_low, outer_high = detection.edge("outer", gap_axis)
         first_pos = (outer_low + inner_low) / 2.0
         second_pos = (inner_high + outer_high) / 2.0
     else:
-        outer_extent = measure_mark_extent(detection, "outer", gap_axis)
-        # Distance from an outer mark centre to the stripe centre, so the near edge
-        # clears the mark's arm tip by mark_clearance.
-        offset_to_edge = outer_extent + mark_clearance + half_thickness
+        ref_low, ref_high = detection.edge(reference, gap_axis)
+        ref_extent = measure_mark_extent(detection, reference, gap_axis)
+        # Distance from a reference mark centre to the stripe centre, so the near
+        # edge clears that mark's arm tip by mark_clearance.
+        offset_to_edge = ref_extent + mark_clearance + half_thickness
         if position == "outer":
-            # Inside the gap, hugging the outer marks.
-            first_pos = outer_low + offset_to_edge
-            second_pos = outer_high - offset_to_edge
-        else:  # beyond: outside the outer ring
-            first_pos = outer_low - offset_to_edge
-            second_pos = outer_high + offset_to_edge
+            # Inward from the reference marks, hugging them.
+            first_pos = ref_low + offset_to_edge
+            second_pos = ref_high - offset_to_edge
+        else:  # beyond: outside the reference ring
+            first_pos = ref_low - offset_to_edge
+            second_pos = ref_high + offset_to_edge
 
     # Extra outward nudge, away from the pattern centre on both sides.
     first_pos -= offset
     second_pos += offset
 
-    half_length = length_factor * detection.outer_radius  # length_factor * diameter / 2
+    ref_radius = detection.inner_radius if reference == "inner" else detection.outer_radius
+    half_length = length_factor * ref_radius  # length_factor * diameter / 2
     half_thickness = thickness / 2.0
     center_x, center_y = detection.center
     shape = detection.image.shape
@@ -235,6 +254,9 @@ def stripe_clearances(
 
     bands = []  # (low, high) span occupied by each mark pair along the gap axis
     for ring in ("inner", "outer"):
+        marks = detection.inner_marks if ring == "inner" else detection.outer_marks
+        if len(marks) != 4:
+            continue  # ring absent in this frame
         extent = measure_mark_extent(detection, ring, gap_axis)
         low, high = detection.edge(ring, gap_axis)
         bands.append((low - extent, low + extent))
@@ -377,6 +399,7 @@ class ProfileResult:
     detection: Detection
     orientation: str
     position: str
+    reference_ring: str
     clearances: Dict[str, float]
     first_roi: Tuple[int, int, int, int]
     second_roi: Tuple[int, int, int, int]
@@ -437,6 +460,7 @@ def analyse(
     position: str = DEFAULT_STRIPE_POSITION,
     mark_clearance: float = DEFAULT_MARK_CLEARANCE,
     offset: float = DEFAULT_STRIPE_OFFSET,
+    reference_ring: str = DEFAULT_STRIPE_REFERENCE,
     object_distance_mm: float = DEFAULT_OBJECT_DISTANCE_MM,
 ) -> ProfileResult:
     """Place the stripes, then fit and normalise each stripe's profile separately.
@@ -453,6 +477,7 @@ def analyse(
         position=position,
         mark_clearance=mark_clearance,
         offset=offset,
+        reference=reference_ring,
     )
     axis, first, second = stripe_profiles(detection.image, first_roi, second_roi, orientation)
 
@@ -467,6 +492,7 @@ def analyse(
         detection=detection,
         orientation=orientation,
         position=position,
+        reference_ring=reference_ring,
         clearances=stripe_clearances(detection, (first_roi, second_roi), orientation),
         first_roi=first_roi,
         second_roi=second_roi,
@@ -565,35 +591,38 @@ def plot_results(result: ProfileResult, image_name: str, output_path: Path):
     overview.set_xlabel("x (px)")
     overview.set_ylabel("y (px)")
 
-    # Zoom on the pattern to confirm each stripe sits in the ring gap, clear of the marks.
-    # Bounds are the union of both stripes and the outer ring, so this works either way round.
+    # Zoom on the pattern to confirm each stripe clears the marks. Bounds are the
+    # union of both stripes and the reference ring, so this works either way round
+    # and whether or not the outer ring was detected.
+    ring = result.reference_ring
+    ring_marks = detection.inner_marks if ring == "inner" else detection.outer_marks
     zoom = fig.add_subplot(grid[1, 0:4])
     pad = 60
     height, width = detection.image.shape
     boxes = np.array(result.rois, dtype=np.float64)
-    zx0 = max(0, int(min(boxes[:, 0].min(), detection.outer_marks[:, 0].min())) - pad)
-    zx1 = min(width - 1, int(max(boxes[:, 2].max(), detection.outer_marks[:, 0].max())) + pad)
-    zy0 = max(0, int(min(boxes[:, 1].min(), detection.outer_marks[:, 1].min())) - pad)
-    zy1 = min(height - 1, int(max(boxes[:, 3].max(), detection.outer_marks[:, 1].max())) + pad)
+    zx0 = max(0, int(min(boxes[:, 0].min(), ring_marks[:, 0].min())) - pad)
+    zx1 = min(width - 1, int(max(boxes[:, 2].max(), ring_marks[:, 0].max())) + pad)
+    zy0 = max(0, int(min(boxes[:, 1].min(), ring_marks[:, 1].min())) - pad)
+    zy1 = min(height - 1, int(max(boxes[:, 3].max(), ring_marks[:, 1].max())) + pad)
     zoom.imshow(display, cmap="gray", vmin=0, vmax=255)
     _draw_marks(zoom, detection)
     _draw_stripes(zoom, result, linewidth=2.2)
     zoom.set_xlim(zx0, zx1)
     zoom.set_ylim(zy1, zy0)
     zoom.set_aspect("equal")
-    # Shade the span each outer mark pair occupies, so it is obvious whether a
+    # Shade the span the reference mark pairs occupy, so it is obvious whether a
     # stripe edge falls inside or outside the mark.
     gap_axis = "y" if result.orientation == "horizontal" else "x"
-    extent = measure_mark_extent(detection, "outer", gap_axis)
-    for edge in detection.edge("outer", gap_axis):
+    extent = measure_mark_extent(detection, ring, gap_axis)
+    for edge in detection.edge(ring, gap_axis):
         if result.orientation == "horizontal":
-            zoom.axhspan(edge - extent, edge + extent, color="#3ba7e0", alpha=0.18, zorder=0)
+            zoom.axhspan(edge - extent, edge + extent, color=RING_STYLE[ring], alpha=0.18, zorder=0)
         else:
-            zoom.axvspan(edge - extent, edge + extent, color="#3ba7e0", alpha=0.18, zorder=0)
+            zoom.axvspan(edge - extent, edge + extent, color=RING_STYLE[ring], alpha=0.18, zorder=0)
 
     gaps = ", ".join(f"{label.split()[0]} {gap:+.1f} px" for label, gap in result.clearances.items())
     zoom.set_title(
-        f"Stripe placement - shaded = outer mark span ({2 * extent:.0f} px wide);"
+        f"Stripe placement - shaded = {ring} mark span ({2 * extent:.0f} px wide);"
         f" clearance {gaps}",
         fontsize=10,
     )
@@ -755,6 +784,7 @@ def result_to_dict(result: ProfileResult, detection_summary: Dict[str, object]) 
         **detection_summary,
         "stripe_orientation": result.orientation,
         "stripe_position": result.position,
+        "stripe_reference_ring": result.reference_ring,
         "stripe_mark_clearance_px": result.clearances,
         "profile_axis": axis_name,
         f"{keys[0]}_roi": list(result.first_roi),
@@ -776,7 +806,7 @@ def describe(result: ProfileResult) -> str:
     axis_name = result.axis_name
     width = max(len(label) for label in result.labels)
     window = f"{result.axis.min():.0f}-{result.axis.max():.0f}"
-    lines = [f"  stripe position: {result.position}"]
+    lines = [f"  stripe position: {result.position} (referenced to the {result.reference_ring} ring)"]
 
     for roi, label in zip(result.rois, result.labels):
         gap = result.clearances[label]
@@ -820,6 +850,7 @@ def process_image(
     stripe_position: str = DEFAULT_STRIPE_POSITION,
     mark_clearance: float = DEFAULT_MARK_CLEARANCE,
     stripe_offset: float = DEFAULT_STRIPE_OFFSET,
+    stripe_reference: str = DEFAULT_STRIPE_REFERENCE,
     object_distance_mm: float = DEFAULT_OBJECT_DISTANCE_MM,
     show: bool = False,
 ) -> Optional[Path]:
@@ -836,7 +867,12 @@ def process_image(
 
     summary = detection_to_dict(detection, image_path)
 
-    if not detection.found:
+    # Outer-referenced stripes need both rings; inner-referenced ones need only the
+    # inner ring, so a frame with a missing outer ring can still be measured.
+    have_rings = len(detection.inner_marks) == 4 and (
+        stripe_reference == "inner" or len(detection.outer_marks) == 4
+    )
+    if not have_rings:
         fig = plot_no_pattern(detection, image_path.name, plot_path)
         save_overlay(None, detection, overlay_path)
         with json_path.open("w", encoding="utf-8") as handle:
@@ -844,7 +880,12 @@ def process_image(
         if show:
             plt.show()
         plt.close(fig)
-        print(f"  saved {plot_path} (no stripes placed)")
+        reason = (
+            "inner ring found but no outer ring; retry with --stripe-reference inner"
+            if len(detection.inner_marks) == 4
+            else "no fiducial pattern"
+        )
+        print(f"  saved {plot_path} (no stripes placed: {reason})")
         return plot_path
 
     result = analyse(
@@ -855,6 +896,7 @@ def process_image(
         position=stripe_position,
         mark_clearance=mark_clearance,
         offset=stripe_offset,
+        reference_ring=stripe_reference,
         object_distance_mm=object_distance_mm,
     )
     print(describe(result))
@@ -926,6 +968,16 @@ def main() -> None:
         help="Extra outward shift in px applied to both stripes, away from the pattern centre",
     )
     parser.add_argument(
+        "--stripe-reference",
+        choices=STRIPE_REFERENCES,
+        default=DEFAULT_STRIPE_REFERENCE,
+        help=(
+            "Ring the stripes are positioned against and that sets their length. "
+            "'inner' allows frames whose outer ring is missing, but those results are "
+            "not comparable with outer-referenced ones"
+        ),
+    )
+    parser.add_argument(
         "--object-distance-mm",
         type=float,
         default=DEFAULT_OBJECT_DISTANCE_MM,
@@ -970,6 +1022,7 @@ def main() -> None:
             stripe_position=args.stripe_position,
             mark_clearance=args.mark_clearance,
             stripe_offset=args.stripe_offset,
+            stripe_reference=args.stripe_reference,
             object_distance_mm=args.object_distance_mm,
             show=args.show,
         )

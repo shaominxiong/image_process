@@ -55,6 +55,20 @@ DEFAULT_BAR_WIDTH = 7
 DEFAULT_BACKGROUND_SIGMA = 25.0
 # Real marks score ~8x the residual noise; frames without the pattern peak below 0.5x.
 DEFAULT_MIN_SNR = 3.0
+# Physical ring radii of the fiducial target, in mm. Only their *ratio* is used for
+# geometry: it is scale-invariant, so it holds across batches shot at different
+# distances, whereas mm-per-px does not and is recomputed per frame.
+INNER_RADIUS_MM = 2.2
+OUTER_RADIUS_MM = 6.0
+NOMINAL_RING_RATIO = OUTER_RADIUS_MM / INNER_RADIUS_MM
+# Measured on the 45 cm cam_2 batch: 2.6995 +- 0.0038, i.e. ~1% below nominal. Part
+# of that is sub-pixel window bias on the closely spaced inner marks; the rest looks
+# like the target differing from its nominal spec. Track ring_ratio_measured across
+# batches to tell those apart.
+# Guided outer search: window around each predicted position, and the (lower)
+# significance floor allowed there because the position is strongly constrained.
+DEFAULT_GUIDED_SEARCH_PX = 35
+DEFAULT_GUIDED_MIN_SNR = 1.5
 
 
 # --------------------------------------------------------------------------- I/O
@@ -285,6 +299,60 @@ def fit_circle(points: np.ndarray) -> Tuple[Tuple[float, float], float]:
     return (float(center_x), float(center_y)), radius
 
 
+def fit_circle_fixed_center(points: np.ndarray, center: Sequence[float]) -> float:
+    """Radius of the best-fit circle through points about a *fixed* centre.
+
+    Used for the outer ring, whose centre is known to coincide with the inner
+    ring's. Fixing the centre means a usable radius comes out of even one mark,
+    which is what makes a partial outer ring workable.
+    """
+    if len(points) == 0:
+        raise ValueError("at least one point is required")
+    offsets = np.asarray(points, dtype=np.float64) - np.asarray(center, dtype=np.float64)
+    return float(np.linalg.norm(offsets, axis=1).mean())
+
+
+def predict_outer_marks(
+    inner_marks: np.ndarray,
+    center: Sequence[float],
+    radius_ratio: float,
+) -> np.ndarray:
+    """Where the outer marks should be, given the inner ring and the radius ratio.
+
+    The two rings are concentric and share the same angular layout, so each outer
+    mark lies along the same ray as its inner counterpart, scaled by the ratio of
+    the physical radii.
+    """
+    origin = np.asarray(center, dtype=np.float64)
+    return origin + (np.asarray(inner_marks, dtype=np.float64) - origin) * radius_ratio
+
+
+def search_mark_near(
+    response: np.ndarray,
+    target: Sequence[float],
+    search_px: int,
+    threshold: float,
+) -> Optional[Tuple[float, float, float]]:
+    """Best crossness peak within ``search_px`` of ``target``.
+
+    Returns (x, y, score) or None if nothing there clears ``threshold``.
+    """
+    height, width = response.shape
+    tx, ty = int(round(target[0])), int(round(target[1]))
+    x_lo, x_hi = max(0, tx - search_px), min(width, tx + search_px + 1)
+    y_lo, y_hi = max(0, ty - search_px), min(height, ty + search_px + 1)
+    if x_hi <= x_lo or y_hi <= y_lo:
+        return None
+
+    window = response[y_lo:y_hi, x_lo:x_hi]
+    index = int(np.argmax(window))
+    dy, dx = divmod(index, window.shape[1])
+    score = float(window[dy, dx])
+    if score < threshold:
+        return None
+    return float(x_lo + dx), float(y_lo + dy), score
+
+
 def sort_points_by_angle(points: np.ndarray, center: Tuple[float, float]) -> np.ndarray:
     """Order points counter-clockwise around a centre."""
     centered = points - np.array(center, dtype=np.float64)
@@ -313,11 +381,26 @@ class Detection:
         self.center: Optional[Tuple[float, float]] = None
         self.noise = 0.0
         self.inner_snr = 0.0
+        # How the outer ring was established: "detected" (4 marks measured),
+        # "partial" (1-3 measured, rest predicted), "predicted" (none measured, ring
+        # placed purely from the inner ring and the mm radius ratio), or "" (none).
+        self.outer_source = ""
+        self.outer_detected = 0
+        # Per-frame scale: depends on camera distance, so it is NOT reusable between
+        # batches. The ring ratio below is the scale-invariant quantity.
+        self.mm_per_px = float("nan")
+        self.ring_ratio_used = float("nan")
+        self.ring_ratio_measured = float("nan")
 
     @property
     def found(self) -> bool:
-        """True once both rings are located."""
+        """True once both rings are established (the outer one may be predicted)."""
         return len(self.inner_marks) == 4 and len(self.outer_marks) == 4
+
+    @property
+    def outer_measured(self) -> bool:
+        """True only when all four outer marks were actually measured."""
+        return self.outer_detected == 4
 
     @property
     def inner_radius(self) -> float:
@@ -346,8 +429,21 @@ def detect(
     bar_width: int = DEFAULT_BAR_WIDTH,
     background_sigma: float = DEFAULT_BACKGROUND_SIGMA,
     min_snr: float = DEFAULT_MIN_SNR,
+    inner_radius_mm: float = INNER_RADIUS_MM,
+    outer_radius_mm: float = OUTER_RADIUS_MM,
+    ring_ratio: Optional[float] = None,
+    guided_search_px: int = DEFAULT_GUIDED_SEARCH_PX,
+    guided_min_snr: float = DEFAULT_GUIDED_MIN_SNR,
 ) -> Detection:
-    """Locate the fiducial pattern in a grayscale frame."""
+    """Locate the fiducial pattern in a grayscale frame.
+
+    The inner ring must be measured. The outer ring is then established in the
+    strongest way available: an unconstrained symmetric-quad search first, and
+    failing that a guided search along the rays through the inner marks, scaled by
+    ``outer_radius_mm / inner_radius_mm``. Marks that still cannot be measured fall
+    back to their predicted positions, and ``Detection.outer_source`` records which
+    of those happened.
+    """
     residual = high_pass(image, background_sigma)
     response = crossness_response(residual, arm_length=arm_length, bar_width=bar_width)
     result = Detection(image, residual, response)
@@ -374,39 +470,66 @@ def detect(
     result.inner_marks = sort_points_by_angle(inner, (float(center[0]), float(center[1])))
     result.center = (float(center[0]), float(center[1]))
     result.inner_circle = fit_circle(result.inner_marks)
+    inner_radius = result.inner_circle[1]
+    # Physical scale straight off the fiducial: the inner ring is a known size.
+    result.mm_per_px = float(inner_radius_mm / inner_radius) if inner_radius > 0 else float("nan")
 
-    # The radius band both excludes the inner marks and bounds where the outer ring
-    # can plausibly sit, so the weak-candidate pool needs no further filtering.
+    centre_tuple = (float(center[0]), float(center[1]))
+    # The ratio is what the geometry needs, and it is distance-independent.
+    radius_ratio = float(ring_ratio) if ring_ratio else outer_radius_mm / inner_radius_mm
+    result.ring_ratio_used = radius_ratio
+
+    # First try the unconstrained search: it needs no prior and is what validates on
+    # frames where the outer ring is clean.
     outer = find_symmetric_quad(
         points,
         center,
-        min_radius=1.3 * result.inner_circle[1],
-        max_radius=8.0 * result.inner_circle[1],
+        min_radius=1.3 * inner_radius,
+        max_radius=8.0 * inner_radius,
     )
-    if outer is None:
+    if outer is not None:
+        outer = np.array([refine_subpixel(residual, p) for p in outer], dtype=np.float64)
+        result.outer_marks = sort_points_by_angle(outer, centre_tuple)
+        result.outer_circle = fit_circle(result.outer_marks)
+        result.outer_detected = 4
+        result.outer_source = "detected"
+        result.ring_ratio_measured = result.outer_circle[1] / inner_radius
         return result
 
-    outer = np.array([refine_subpixel(residual, p) for p in outer], dtype=np.float64)
-    result.outer_marks = sort_points_by_angle(outer, (float(center[0]), float(center[1])))
-    result.outer_circle = fit_circle(result.outer_marks)
+    # Otherwise use the known geometry: the rings are concentric with a fixed radius
+    # ratio, so each outer mark is predictable to within a few px. Search a small
+    # window around each prediction and keep whatever is measurable.
+    predicted = predict_outer_marks(result.inner_marks, center, radius_ratio)
+    threshold = guided_min_snr * result.noise
+    marks, measured = [], 0
+    for target in predicted:
+        hit = search_mark_near(response, target, guided_search_px, threshold)
+        if hit is None:
+            marks.append(target)  # fall back to the predicted position
+        else:
+            marks.append(np.array(refine_subpixel(residual, hit[:2]), dtype=np.float64))
+            measured += 1
+
+    result.outer_marks = sort_points_by_angle(np.array(marks, dtype=np.float64), centre_tuple)
+    result.outer_detected = measured
+    result.outer_source = "detected" if measured == 4 else ("partial" if measured else "predicted")
+    # Centre is fixed to the inner ring's, so even one measured mark gives a radius.
+    if measured:
+        measured_marks = np.array(
+            [m for m, p in zip(marks, predicted) if not np.allclose(m, p)], dtype=np.float64
+        ).reshape(-1, 2)
+        radius = fit_circle_fixed_center(measured_marks, center)
+    else:
+        radius = inner_radius * radius_ratio
+    result.outer_circle = (centre_tuple, float(radius))
+    if measured:
+        result.ring_ratio_measured = radius / inner_radius
     return result
 
 
-def detect_file(
-    image_path: Path,
-    arm_length: int = DEFAULT_ARM_LENGTH,
-    bar_width: int = DEFAULT_BAR_WIDTH,
-    background_sigma: float = DEFAULT_BACKGROUND_SIGMA,
-    min_snr: float = DEFAULT_MIN_SNR,
-) -> Detection:
+def detect_file(image_path: Path, **kwargs) -> Detection:
     """Load a DNG and detect its fiducial marks."""
-    return detect(
-        load_image(image_path),
-        arm_length=arm_length,
-        bar_width=bar_width,
-        background_sigma=background_sigma,
-        min_snr=min_snr,
-    )
+    return detect(load_image(image_path), **kwargs)
 
 
 # -------------------------------------------------------------------- reporting
@@ -431,6 +554,14 @@ def detection_to_dict(result: Detection, image_path: Path) -> Dict[str, object]:
         "outer_marks": [[float(p[0]), float(p[1])] for p in result.outer_marks],
         "inner_circle": circle_dict(result.inner_circle),
         "outer_circle": circle_dict(result.outer_circle),
+        "outer_ring_source": result.outer_source,
+        "outer_marks_measured": result.outer_detected,
+        "mm_per_px": result.mm_per_px,
+        "mm_per_px_note": "per-frame; depends on camera distance, not reusable across batches",
+        "ring_ratio_used": result.ring_ratio_used,
+        "ring_ratio_measured": result.ring_ratio_measured,
+        "ring_ratio_note": "scale-invariant; expected constant across batches",
+        "ring_radii_mm": {"inner": INNER_RADIUS_MM, "outer": OUTER_RADIUS_MM},
     }
 
 
@@ -440,10 +571,23 @@ def describe(result: Detection, name: str) -> str:
         if len(result.inner_marks) == 4:
             return f"{name}: inner ring only, no concentric outer ring"
         return f"{name}: no fiducial pattern (mark SNR {result.inner_snr:.2f})"
+    outer_note = {
+        "detected": "all 4 outer marks measured",
+        "partial": f"{result.outer_detected}/4 outer marks measured, rest predicted",
+        "predicted": "outer ring predicted from the inner ring and the mm radius ratio",
+    }.get(result.outer_source, result.outer_source)
     return (
-        f"{name}: 8 marks, SNR {result.inner_snr:.1f}\n"
+        f"{name}: inner ring + outer ring, SNR {result.inner_snr:.1f}\n"
         f"  centre = ({result.center[0]:.1f}, {result.center[1]:.1f})\n"
         f"  r_inner = {result.inner_radius:.1f} px, r_outer = {result.outer_radius:.1f} px"
+        f"   ({result.mm_per_px * 1000:.2f} um/px)\n"
+        f"  outer ring: {outer_note}\n"
+        f"  ring ratio: used {result.ring_ratio_used:.4f}"
+        + (
+            f", measured {result.ring_ratio_measured:.4f}"
+            if np.isfinite(result.ring_ratio_measured)
+            else " (not measurable in this frame)"
+        )
     )
 
 
@@ -462,6 +606,26 @@ def add_detection_arguments(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=DEFAULT_MIN_SNR,
         help="Minimum mark response, in units of residual noise, for a valid detection",
+    )
+    parser.add_argument(
+        "--inner-radius-mm",
+        type=float,
+        default=INNER_RADIUS_MM,
+        help="Physical radius of the inner fiducial ring in mm",
+    )
+    parser.add_argument(
+        "--ring-ratio",
+        type=float,
+        default=None,
+        help="Outer/inner radius ratio to use directly, overriding the mm radii. This "
+             "ratio is scale-invariant, so it carries across batches at different distances",
+    )
+    parser.add_argument(
+        "--outer-radius-mm",
+        type=float,
+        default=OUTER_RADIUS_MM,
+        help="Physical radius of the outer fiducial ring in mm; its ratio to the inner "
+             "radius predicts the outer marks when they cannot be measured",
     )
 
 
@@ -495,6 +659,9 @@ def main() -> None:
             bar_width=args.bar_width,
             background_sigma=args.background_sigma,
             min_snr=args.min_snr,
+            inner_radius_mm=args.inner_radius_mm,
+            outer_radius_mm=args.outer_radius_mm,
+            ring_ratio=args.ring_ratio,
         )
         print(describe(result, image_path.name))
 
