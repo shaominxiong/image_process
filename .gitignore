@@ -1,0 +1,10 @@
+# Generated plots, CSVs, and JSON summaries (regenerate with process_images.py)
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# macOS
+.DS_Store
