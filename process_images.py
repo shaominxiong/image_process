@@ -51,11 +51,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Circle, Rectangle
+from matplotlib.patches import Circle, Polygon, Rectangle
+from scipy.ndimage import gaussian_filter, map_coordinates
 
 from detect_fiducials import (
+    CHANNELS,
+    DEFAULT_CHANNEL,
     Detection,
     add_detection_arguments,
+    add_loading_arguments,
     detect,
     detection_to_dict,
     discover_images,
@@ -67,6 +71,9 @@ from detect_fiducials import describe as describe_detection
 DEFAULT_STRIPE_LENGTH_FACTOR = 1.05
 DEFAULT_STRIPE_THICKNESS = 50
 ORIENTATIONS = ("horizontal", "vertical")
+# "auto" is accepted at the CLI: it measures the gradient across the outer circle and
+# runs the stripes along it, which needs the rotated sampling path.
+ORIENTATION_CHOICES = ("horizontal", "vertical", "auto")
 DEFAULT_ORIENTATION = "horizontal"
 # Where each stripe sits relative to the ring gap it belongs to.
 STRIPE_POSITIONS = ("centred", "outer", "beyond")
@@ -92,6 +99,14 @@ STRIPE_LABELS = {
 }
 # The stripe's long axis: profiles run along it.
 PROFILE_AXIS = {"horizontal": "x", "vertical": "y"}
+# Stripe angle in degrees for the two axis-aligned orientations, measuring the long
+# axis anticlockwise from +x. Any other angle uses the rotated sampling path.
+ORIENTATION_ANGLE = {"horizontal": 0.0, "vertical": 90.0}
+# Gradient measurement: smoothing applied before differencing, and the magnitude
+# (counts/px) below which the direction is treated as undetermined -- near the beam
+# centre the gradient vanishes and its direction is pure noise.
+DEFAULT_GRADIENT_SIGMA = 15.0
+DEFAULT_MIN_GRADIENT = 0.30
 
 
 # --------------------------------------------------------------------- ROI layout
@@ -106,6 +121,87 @@ def _clip_roi(x0: float, y0: float, x1: float, y1: float, shape: Tuple[int, int]
         max(0, min(width - 1, int(round(x1)))),
         max(0, min(height - 1, int(round(y1)))),
     )
+
+
+def measure_gradient_direction(
+    detection: Detection,
+    sigma: float = DEFAULT_GRADIENT_SIGMA,
+    radius_scale: float = 1.0,
+    min_gradient: float = DEFAULT_MIN_GRADIENT,
+) -> Dict[str, float]:
+    """Direction of steepest intensity change across the outer circle.
+
+    The illumination is a smooth ramp over this region, so the *net* gradient vector
+    averaged over the disc gives the falloff direction. Marks are small and
+    symmetric about the centre, so they contribute almost nothing to that mean.
+
+    Returns the angle of the gradient in degrees (0 = +x, 90 = +y, i.e. downward in
+    image coordinates), its magnitude in counts/px, and ``determined``: False when
+    the magnitude is below ``min_gradient``, which happens near the beam centre
+    where the gradient genuinely vanishes and its direction is meaningless.
+    """
+    image = detection.image
+    smooth = gaussian_filter(image, sigma)
+    grad_y, grad_x = np.gradient(smooth)
+
+    cx, cy = detection.center
+    radius = detection.outer_radius * radius_scale
+    height, width = image.shape
+    y0, y1 = max(0, int(cy - radius)), min(height, int(cy + radius) + 1)
+    x0, x1 = max(0, int(cx - radius)), min(width, int(cx + radius) + 1)
+
+    ys, xs = np.mgrid[y0:y1, x0:x1]
+    inside = (xs - cx) ** 2 + (ys - cy) ** 2 <= radius**2
+    mean_gx = float(grad_x[y0:y1, x0:x1][inside].mean())
+    mean_gy = float(grad_y[y0:y1, x0:x1][inside].mean())
+
+    magnitude = float(np.hypot(mean_gx, mean_gy))
+    angle = float(np.degrees(np.arctan2(mean_gy, mean_gx)))
+    return {
+        "angle_deg": angle % 180.0,  # a stripe direction is mod 180
+        "signed_angle_deg": angle,
+        "magnitude": magnitude,
+        "gx": mean_gx,
+        "gy": mean_gy,
+        "determined": bool(magnitude >= min_gradient),
+        "nearest_axis": "horizontal" if abs(mean_gx) >= abs(mean_gy) else "vertical",
+    }
+
+
+def resolve_stripe_angle(
+    detection: Detection,
+    orientation: str,
+    stripe_angle: Optional[float] = None,
+    fallback_angle: float = 0.0,
+    min_gradient: float = DEFAULT_MIN_GRADIENT,
+    gradient_sigma: float = DEFAULT_GRADIENT_SIGMA,
+) -> Dict[str, object]:
+    """Decide the stripe long-axis angle, and say where it came from.
+
+    ``stripe_angle`` wins if given. ``orientation="auto"`` measures the gradient
+    across the outer circle and uses that direction, falling back to
+    ``fallback_angle`` when the gradient is too weak to define one.
+    """
+    if stripe_angle is not None:
+        return {"angle": float(stripe_angle) % 180.0, "source": "fixed", "gradient": None}
+
+    if orientation != "auto":
+        return {"angle": ORIENTATION_ANGLE[orientation], "source": orientation, "gradient": None}
+
+    gradient = measure_gradient_direction(
+        detection, sigma=gradient_sigma, min_gradient=min_gradient
+    )
+    if gradient["determined"]:
+        return {"angle": gradient["angle_deg"], "source": "gradient", "gradient": gradient}
+    return {"angle": float(fallback_angle) % 180.0, "source": "fallback", "gradient": gradient}
+
+
+def _unit_vectors(angle_deg: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Along-stripe and across-stripe unit vectors for a long-axis angle."""
+    radians = np.radians(angle_deg)
+    along = np.array([np.cos(radians), np.sin(radians)], dtype=np.float64)
+    across = np.array([-np.sin(radians), np.cos(radians)], dtype=np.float64)
+    return along, across
 
 
 def measure_mark_extent(
@@ -236,6 +332,187 @@ def stripe_rois(
         first = _clip_roi(first_pos - half_thickness, y0, first_pos + half_thickness, y1, shape)
         second = _clip_roi(second_pos - half_thickness, y0, second_pos + half_thickness, y1, shape)
     return first, second
+
+
+@dataclass
+class Stripe:
+    """A stripe of arbitrary orientation, used when the angle is not 0 or 90 deg."""
+
+    centre: np.ndarray  # (x, y)
+    angle: float  # long-axis angle in degrees, anticlockwise from +x
+    half_length: float
+    half_thickness: float
+
+    @property
+    def along(self) -> np.ndarray:
+        return _unit_vectors(self.angle)[0]
+
+    @property
+    def across(self) -> np.ndarray:
+        return _unit_vectors(self.angle)[1]
+
+    def corners(self) -> np.ndarray:
+        """Four corners in order, for drawing."""
+        along, across = _unit_vectors(self.angle)
+        return np.array(
+            [
+                self.centre + along * self.half_length + across * self.half_thickness,
+                self.centre + along * self.half_length - across * self.half_thickness,
+                self.centre - along * self.half_length - across * self.half_thickness,
+                self.centre - along * self.half_length + across * self.half_thickness,
+            ]
+        )
+
+    def bounding_box(self, shape: Tuple[int, int]) -> Tuple[int, int, int, int]:
+        """Axis-aligned box enclosing the stripe, for reporting alongside the boxes."""
+        c = self.corners()
+        return _clip_roi(c[:, 0].min(), c[:, 1].min(), c[:, 0].max(), c[:, 1].max(), shape)
+
+
+def sample_stripe(image: np.ndarray, stripe: Stripe, step: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+    """Mean intensity along a rotated stripe, sampled by bilinear interpolation.
+
+    Returns the signed distance along the stripe from its centre (px) and the profile
+    averaged across its thickness.
+    """
+    along, across = _unit_vectors(stripe.angle)
+    s = np.arange(-stripe.half_length, stripe.half_length + step / 2.0, step)
+    t = np.arange(-stripe.half_thickness, stripe.half_thickness + 0.5, 1.0)
+
+    # Grid of shape (across samples, along samples), then average across.
+    xs = stripe.centre[0] + along[0] * s[None, :] + across[0] * t[:, None]
+    ys = stripe.centre[1] + along[1] * s[None, :] + across[1] * t[:, None]
+
+    values = map_coordinates(image, [ys, xs], order=1, mode="nearest")
+    return s, values.mean(axis=0)
+
+
+def measure_mark_extent_along(
+    detection: Detection,
+    ring: str,
+    direction: np.ndarray,
+    threshold_sigma: float = 2.0,
+    search: int = 60,
+) -> float:
+    """Half-extent of a ring's mark arms along an arbitrary direction, in px.
+
+    The rotated analogue of measure_mark_extent: samples the residual along
+    ``direction`` through each mark and takes the largest run above threshold.
+    """
+    marks = detection.inner_marks if ring == "inner" else detection.outer_marks
+    residual = detection.residual
+    threshold = threshold_sigma * detection.noise
+    offsets = np.arange(-search, search + 1, 1.0)
+
+    extents = [0.0]
+    for mark in marks:
+        xs = mark[0] + direction[0] * offsets
+        ys = mark[1] + direction[1] * offsets
+        profile = map_coordinates(residual, [ys, xs], order=1, mode="nearest")
+        above = np.nonzero(profile > threshold)[0]
+        if len(above):
+            centre_index = len(offsets) // 2
+            extents.append(float(max(centre_index - above.min(), above.max() - centre_index)))
+    return max(extents)
+
+
+def rotated_stripes(
+    detection: Detection,
+    angle: float,
+    length_factor: float = DEFAULT_STRIPE_LENGTH_FACTOR,
+    thickness: int = DEFAULT_STRIPE_THICKNESS,
+    position: str = DEFAULT_STRIPE_POSITION,
+    mark_clearance: float = DEFAULT_MARK_CLEARANCE,
+    offset: float = DEFAULT_STRIPE_OFFSET,
+    reference: str = DEFAULT_STRIPE_REFERENCE,
+) -> Tuple[Stripe, Stripe]:
+    """Two stripes at ``angle``, offset either side of the centre along its normal.
+
+    Same construction as the axis-aligned case with the gap axis replaced by the
+    stripe normal, so gaps and clearances are measured perpendicular to the stripes.
+    """
+    if len(detection.inner_marks) != 4:
+        raise ValueError("the inner fiducial ring is required to place the stripes")
+
+    centre = np.array(detection.center, dtype=np.float64)
+    across = _unit_vectors(angle)[1]
+    half_thickness = thickness / 2.0
+
+    def projections(ring: str) -> np.ndarray:
+        """Signed distances of a ring's marks from the centre along the normal."""
+        marks = detection.inner_marks if ring == "inner" else detection.outer_marks
+        return (marks - centre) @ across
+
+    # A tilted stripe can clip a mark that sits off to one side even when the pair
+    # *means* look clear, so bound against the individual extreme marks. Treat each
+    # mark as a disc of its arm extent, which contains the cross.
+    mark_radius = max(
+        measure_mark_extent_along(detection, ring, across)
+        for ring in ("inner", "outer")
+        if len(detection.inner_marks if ring == "inner" else detection.outer_marks) == 4
+    )
+
+    if position == "centred":
+        inner = projections("inner")
+        outer = projections("outer")
+        first_d = (outer.min() + inner.min()) / 2.0
+        second_d = (inner.max() + outer.max()) / 2.0
+    else:
+        ref = projections(reference)
+        step = mark_radius + mark_clearance + half_thickness
+        if position == "outer":
+            first_d, second_d = ref.min() + step, ref.max() - step
+        else:  # beyond: clear of every mark on that side, whatever its position along s
+            all_proj = np.concatenate(
+                [projections(r) for r in ("inner", "outer")
+                 if len((detection.inner_marks if r == "inner" else detection.outer_marks)) == 4]
+            )
+            first_d = all_proj.min() - step
+            second_d = all_proj.max() + step
+
+    first_d -= offset
+    second_d += offset
+
+    ref_radius = detection.inner_radius if reference == "inner" else detection.outer_radius
+    half_length = length_factor * ref_radius
+    return (
+        Stripe(centre + across * first_d, angle, half_length, half_thickness),
+        Stripe(centre + across * second_d, angle, half_length, half_thickness),
+    )
+
+
+def rotated_clearances(detection: Detection, stripes: Tuple[Stripe, Stripe], labels: Tuple[str, str]) -> Dict[str, float]:
+    """True 2D gap in px between each rotated stripe rectangle and the nearest mark.
+
+    Each mark is transformed into the stripe's own (along, across) frame and its
+    distance to the rectangle taken there. Projecting marks onto the normal alone --
+    the axis-aligned shortcut -- is wrong once the stripe is tilted, because it
+    discards where the mark sits along the stripe and so misses real overlaps.
+    """
+    marks = [m for ring in ("inner", "outer")
+             for m in (detection.inner_marks if ring == "inner" else detection.outer_marks)]
+    if not marks:
+        return {label: float("nan") for label in labels}
+
+    across = stripes[0].across
+    radius = max(
+        measure_mark_extent_along(detection, ring, across)
+        for ring in ("inner", "outer")
+        if len((detection.inner_marks if ring == "inner" else detection.outer_marks)) == 4
+    )
+
+    clearances = {}
+    for stripe, label in zip(stripes, labels):
+        along, normal = _unit_vectors(stripe.angle)
+        gaps = []
+        for mark in marks:
+            delta = np.asarray(mark, dtype=np.float64) - stripe.centre
+            s, t = float(delta @ along), float(delta @ normal)
+            ds = max(0.0, abs(s) - stripe.half_length)
+            dt = max(0.0, abs(t) - stripe.half_thickness)
+            gaps.append(float(np.hypot(ds, dt)) - radius)
+        clearances[label] = min(gaps)
+    return clearances
 
 
 def stripe_clearances(
@@ -416,13 +693,26 @@ class ProfileResult:
     axis_angle_deg: np.ndarray
     axis_mm: np.ndarray
     axis_from_center: np.ndarray
+    # Stripe direction. angle 0/90 with stripes=None means the axis-aligned path.
+    angle: float = 0.0
+    angle_source: str = "horizontal"
+    gradient: Optional[Dict[str, float]] = None
+    stripes: Optional[Tuple["Stripe", "Stripe"]] = None
+
+    @property
+    def rotated(self) -> bool:
+        return self.stripes is not None
 
     @property
     def labels(self) -> Tuple[str, str]:
+        if self.rotated:
+            return ("stripeA", "stripeB")
         return STRIPE_LABELS[self.orientation]
 
     @property
     def axis_name(self) -> str:
+        if self.rotated:
+            return "s"  # signed distance along the stripe from its centre
         return PROFILE_AXIS[self.orientation]
 
     @property
@@ -462,38 +752,91 @@ def analyse(
     offset: float = DEFAULT_STRIPE_OFFSET,
     reference_ring: str = DEFAULT_STRIPE_REFERENCE,
     object_distance_mm: float = DEFAULT_OBJECT_DISTANCE_MM,
+    stripe_angle: Optional[float] = None,
+    fallback_angle: float = 0.0,
+    min_gradient: float = DEFAULT_MIN_GRADIENT,
+    gradient_sigma: float = DEFAULT_GRADIENT_SIGMA,
 ) -> ProfileResult:
     """Place the stripes, then fit and normalise each stripe's profile separately.
 
     The two stripes are never summed. Each gets its own second-order fit, and both
     are normalised by the same reference -- the larger of the two fitted maxima --
     so the curves stay directly comparable to one another.
+
+    ``orientation="auto"`` or an explicit ``stripe_angle`` runs stripes at that angle
+    via rotated sampling; "horizontal"/"vertical" keep the axis-aligned integer-box
+    path so previously published numbers stay reproducible.
     """
-    first_roi, second_roi = stripe_rois(
+    chosen = resolve_stripe_angle(
         detection,
-        orientation=orientation,
-        length_factor=length_factor,
-        thickness=thickness,
-        position=position,
-        mark_clearance=mark_clearance,
-        offset=offset,
-        reference=reference_ring,
+        orientation,
+        stripe_angle=stripe_angle,
+        fallback_angle=fallback_angle,
+        min_gradient=min_gradient,
+        gradient_sigma=gradient_sigma,
     )
-    axis, first, second = stripe_profiles(detection.image, first_roi, second_roi, orientation)
+    angle, angle_source, gradient = chosen["angle"], chosen["source"], chosen["gradient"]
+    rotated = angle_source in ("fixed", "gradient", "fallback")
+
+    if rotated:
+        stripes = rotated_stripes(
+            detection,
+            angle,
+            length_factor=length_factor,
+            thickness=thickness,
+            position=position,
+            mark_clearance=mark_clearance,
+            offset=offset,
+            reference=reference_ring,
+        )
+        axis, first = sample_stripe(detection.image, stripes[0])
+        axis_b, second = sample_stripe(detection.image, stripes[1])
+        if len(axis_b) != len(axis):
+            raise ValueError("rotated stripes produced different sample counts")
+        labels = ("stripeA", "stripeB")
+        clearances = rotated_clearances(detection, stripes, labels)
+        first_roi = stripes[0].bounding_box(detection.image.shape)
+        second_roi = stripes[1].bounding_box(detection.image.shape)
+        # The profile axis is distance along the stripe, already centred on the
+        # pattern, so angle/mm use the sensor extent along the dominant component.
+        size, fov = axis_geometry(detection.image.shape, "horizontal" if abs(np.cos(np.radians(angle))) >= 0.5 else "vertical")
+        axis_from_center = axis.copy()
+        axis_angle = np.degrees(np.arctan(axis / _focal_px(size, fov)))
+        axis_mm_values = object_distance_mm * axis / _focal_px(size, fov)
+    else:
+        stripes = None
+        first_roi, second_roi = stripe_rois(
+            detection,
+            orientation=orientation,
+            length_factor=length_factor,
+            thickness=thickness,
+            position=position,
+            mark_clearance=mark_clearance,
+            offset=offset,
+            reference=reference_ring,
+        )
+        axis, first, second = stripe_profiles(detection.image, first_roi, second_roi, orientation)
+        clearances = stripe_clearances(detection, (first_roi, second_roi), orientation)
+        size, fov = axis_geometry(detection.image.shape, orientation)
+        centre_along = detection.center[0] if orientation == "horizontal" else detection.center[1]
+        axis_from_center = axis - centre_along
+        axis_angle = pixel_to_angle(axis, size, fov)
+        axis_mm_values = pixel_to_mm(axis, object_distance_mm, size, fov)
 
     first_fit = fit_second_order(axis, first)
     second_fit = fit_second_order(axis, second)
     reference = max(float(first_fit["peak_value"]), float(second_fit["peak_value"]))
-
-    size, fov = axis_geometry(detection.image.shape, orientation)
-    center_along_axis = detection.center[0] if orientation == "horizontal" else detection.center[1]
 
     return ProfileResult(
         detection=detection,
         orientation=orientation,
         position=position,
         reference_ring=reference_ring,
-        clearances=stripe_clearances(detection, (first_roi, second_roi), orientation),
+        angle=angle,
+        angle_source=angle_source,
+        gradient=gradient,
+        stripes=stripes,
+        clearances=clearances,
         first_roi=first_roi,
         second_roi=second_roi,
         axis=axis,
@@ -506,9 +849,9 @@ def analyse(
         second_norm=normalize_by(second, reference),
         first_fitted_norm=normalize_by(first_fit["fitted"], reference),
         second_fitted_norm=normalize_by(second_fit["fitted"], reference),
-        axis_angle_deg=pixel_to_angle(axis, size, fov),
-        axis_mm=pixel_to_mm(axis, object_distance_mm, size, fov),
-        axis_from_center=axis - center_along_axis,
+        axis_angle_deg=axis_angle,
+        axis_mm=axis_mm_values,
+        axis_from_center=axis_from_center,
     )
 
 
@@ -550,7 +893,14 @@ def _draw_marks(axis, detection: Detection) -> None:
 
 
 def _draw_stripes(axis, result: ProfileResult, linewidth: float = 1.8) -> None:
-    """Draw the two measurement stripes."""
+    """Draw the two measurement stripes, rotated when the angle is not axis-aligned."""
+    if result.rotated:
+        for stripe, color, label in zip(result.stripes, STRIPE_COLORS, result.labels):
+            axis.add_patch(
+                Polygon(stripe.corners(), closed=True, fill=False, edgecolor=color,
+                        linewidth=linewidth, label=label)
+            )
+        return
     for roi, color, label in zip(result.rois, STRIPE_COLORS, result.labels):
         x0, y0, x1, y1 = roi
         axis.add_patch(
@@ -583,10 +933,16 @@ def plot_results(result: ProfileResult, image_name: str, output_path: Path):
     overview.imshow(display, cmap="gray", vmin=0, vmax=255)
     _draw_marks(overview, detection)
     _draw_stripes(overview, result)
-    overview.set_title(
-        f"{result.orientation.title()} stripes, position '{result.position}' - {image_name}"
-        f"  (mark SNR {detection.inner_snr:.1f})"
-    )
+    if result.rotated:
+        grad = result.gradient
+        extra = f", |grad| {grad['magnitude']:.2f}/px" if grad else ""
+        heading = (
+            f"Stripes at {result.angle:.1f} deg ({result.angle_source}{extra}), "
+            f"position '{result.position}'"
+        )
+    else:
+        heading = f"{result.orientation.title()} stripes, position '{result.position}'"
+    overview.set_title(f"{heading} - {image_name}  (mark SNR {detection.inner_snr:.1f})")
     overview.legend(loc="upper right", framealpha=0.85, fontsize=9)
     overview.set_xlabel("x (px)")
     overview.set_ylabel("y (px)")
@@ -611,21 +967,21 @@ def plot_results(result: ProfileResult, image_name: str, output_path: Path):
     zoom.set_ylim(zy1, zy0)
     zoom.set_aspect("equal")
     # Shade the span the reference mark pairs occupy, so it is obvious whether a
-    # stripe edge falls inside or outside the mark.
+    # stripe edge falls inside or outside the mark. Only meaningful axis-aligned.
     gap_axis = "y" if result.orientation == "horizontal" else "x"
-    extent = measure_mark_extent(detection, ring, gap_axis)
-    for edge in detection.edge(ring, gap_axis):
-        if result.orientation == "horizontal":
-            zoom.axhspan(edge - extent, edge + extent, color=RING_STYLE[ring], alpha=0.18, zorder=0)
-        else:
-            zoom.axvspan(edge - extent, edge + extent, color=RING_STYLE[ring], alpha=0.18, zorder=0)
+    if not result.rotated:
+        extent = measure_mark_extent(detection, ring, gap_axis)
+        for edge in detection.edge(ring, gap_axis):
+            if result.orientation == "horizontal":
+                zoom.axhspan(edge - extent, edge + extent, color=RING_STYLE[ring], alpha=0.18, zorder=0)
+            else:
+                zoom.axvspan(edge - extent, edge + extent, color=RING_STYLE[ring], alpha=0.18, zorder=0)
+        shaded = f"shaded = {ring} mark span ({2 * extent:.0f} px wide); "
+    else:
+        shaded = ""
 
     gaps = ", ".join(f"{label.split()[0]} {gap:+.1f} px" for label, gap in result.clearances.items())
-    zoom.set_title(
-        f"Stripe placement - shaded = {ring} mark span ({2 * extent:.0f} px wide);"
-        f" clearance {gaps}",
-        fontsize=10,
-    )
+    zoom.set_title(f"Stripe placement - {shaded}clearance {gaps}", fontsize=10)
     zoom.set_xlabel("x (px)")
     zoom.set_ylabel("y (px)")
 
@@ -783,6 +1139,9 @@ def result_to_dict(result: ProfileResult, detection_summary: Dict[str, object]) 
     return {
         **detection_summary,
         "stripe_orientation": result.orientation,
+        "stripe_angle_deg": result.angle,
+        "stripe_angle_source": result.angle_source,
+        "gradient": result.gradient,
         "stripe_position": result.position,
         "stripe_reference_ring": result.reference_ring,
         "stripe_mark_clearance_px": result.clearances,
@@ -807,6 +1166,12 @@ def describe(result: ProfileResult) -> str:
     width = max(len(label) for label in result.labels)
     window = f"{result.axis.min():.0f}-{result.axis.max():.0f}"
     lines = [f"  stripe position: {result.position} (referenced to the {result.reference_ring} ring)"]
+    if result.rotated:
+        grad = result.gradient
+        detail = f" from gradient |g|={grad['magnitude']:.2f}/px" if grad and grad.get("determined") else ""
+        if grad is not None and not grad.get("determined"):
+            detail = f" (gradient only {grad['magnitude']:.2f}/px - too weak, used fallback)"
+        lines.append(f"  stripe angle: {result.angle:.1f} deg [{result.angle_source}]{detail}")
 
     for roi, label in zip(result.rois, result.labels):
         gap = result.clearances[label]
@@ -852,12 +1217,19 @@ def process_image(
     stripe_offset: float = DEFAULT_STRIPE_OFFSET,
     stripe_reference: str = DEFAULT_STRIPE_REFERENCE,
     object_distance_mm: float = DEFAULT_OBJECT_DISTANCE_MM,
+    stripe_angle: Optional[float] = None,
+    fallback_angle: float = 0.0,
+    min_gradient: float = DEFAULT_MIN_GRADIENT,
+    channel: str = DEFAULT_CHANNEL,
     show: bool = False,
+    quiet: bool = False,
 ) -> Optional[Path]:
     """Detect, measure, and plot one frame. Returns the plot path."""
-    image = load_image(image_path)
+    image = load_image(image_path, channel=channel)
     detection = detect(image, **(detection_kwargs or {}))
-    print(describe_detection(detection, image_path.name))
+    detection.channel = channel
+    if not quiet:
+        print(describe_detection(detection, image_path.name))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_path = output_dir / f"{image_path.stem}_profile.png"
@@ -885,7 +1257,8 @@ def process_image(
             if len(detection.inner_marks) == 4
             else "no fiducial pattern"
         )
-        print(f"  saved {plot_path} (no stripes placed: {reason})")
+        if not quiet:
+            print(f"  saved {plot_path} (no stripes placed: {reason})")
         return plot_path
 
     result = analyse(
@@ -898,8 +1271,12 @@ def process_image(
         offset=stripe_offset,
         reference_ring=stripe_reference,
         object_distance_mm=object_distance_mm,
+        stripe_angle=stripe_angle,
+        fallback_angle=fallback_angle,
+        min_gradient=min_gradient,
     )
-    print(describe(result))
+    if not quiet:
+        print(describe(result))
 
     fig = plot_results(result, image_path.name, plot_path)
     save_overlay(result, detection, overlay_path)
@@ -911,8 +1288,19 @@ def process_image(
         plt.show()
     plt.close(fig)
 
-    print(f"  saved {plot_path}")
+    if not quiet:
+        print(f"  saved {plot_path}")
     return plot_path
+
+
+def _worker(payload):
+    """Module-level entry point for the process pool."""
+    path, kwargs = payload
+    try:
+        process_image(Path(path), quiet=True, **kwargs)
+        return (path, None)
+    except Exception as exc:  # keep a long batch alive
+        return (path, str(exc))
 
 
 def main() -> None:
@@ -923,12 +1311,31 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("output"), help="Directory for outputs")
     parser.add_argument(
         "--orientation",
-        choices=ORIENTATIONS,
+        choices=ORIENTATION_CHOICES,
         default=DEFAULT_ORIENTATION,
         help=(
-            "Stripe orientation: 'horizontal' puts them in the top/bottom ring gaps "
-            "and profiles along x; 'vertical' puts them in the left/right gaps and profiles along y"
+            "Stripe orientation: 'horizontal' profiles along x, 'vertical' along y, "
+            "'auto' measures the intensity gradient across the outer circle and runs "
+            "the stripes along the steepest direction"
         ),
+    )
+    parser.add_argument(
+        "--stripe-angle",
+        type=float,
+        default=None,
+        help="Fixed stripe long-axis angle in degrees (0 = +x). Overrides --orientation",
+    )
+    parser.add_argument(
+        "--fallback-angle",
+        type=float,
+        default=0.0,
+        help="Angle used when --orientation auto finds too weak a gradient to define one",
+    )
+    parser.add_argument(
+        "--min-gradient",
+        type=float,
+        default=DEFAULT_MIN_GRADIENT,
+        help="Gradient magnitude (counts/px) below which the auto direction is undetermined",
     )
     parser.add_argument(
         "--stripe-length-factor",
@@ -991,6 +1398,13 @@ def main() -> None:
         help="Filename glob to filter a directory, e.g. '*cam_2*'",
     )
     parser.add_argument("--limit", type=int, default=None, help="Process at most N images from a directory")
+    add_loading_arguments(parser)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel worker processes; >1 suppresses the per-frame detail and prints progress only",
+    )
     add_detection_arguments(parser)
     args = parser.parse_args()
 
@@ -1011,21 +1425,42 @@ def main() -> None:
         "min_snr": args.min_snr,
     }
 
+    shared = dict(
+        output_dir=args.output_dir.resolve(),
+        detection_kwargs=detection_kwargs,
+        orientation=args.orientation,
+        stripe_length_factor=args.stripe_length_factor,
+        stripe_thickness=args.stripe_thickness,
+        stripe_position=args.stripe_position,
+        mark_clearance=args.mark_clearance,
+        stripe_offset=args.stripe_offset,
+        stripe_reference=args.stripe_reference,
+        object_distance_mm=args.object_distance_mm,
+        stripe_angle=args.stripe_angle,
+        fallback_angle=args.fallback_angle,
+        min_gradient=args.min_gradient,
+        channel=args.channel,
+    )
+
+    if args.workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+
+        failures = []
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            for i, (path, err) in enumerate(
+                pool.map(_worker, [(str(p), shared) for p in images], chunksize=1), 1
+            ):
+                if err:
+                    failures.append((path, err))
+                if i % 20 == 0 or i == len(images):
+                    print(f"  {i}/{len(images)} frames", flush=True)
+        for path, err in failures:
+            print(f"  FAILED {Path(path).name}: {err}")
+        print(f"done: {len(images) - len(failures)}/{len(images)} frames written")
+        return
+
     for image_path in images:
-        process_image(
-            image_path,
-            args.output_dir.resolve(),
-            detection_kwargs=detection_kwargs,
-            orientation=args.orientation,
-            stripe_length_factor=args.stripe_length_factor,
-            stripe_thickness=args.stripe_thickness,
-            stripe_position=args.stripe_position,
-            mark_clearance=args.mark_clearance,
-            stripe_offset=args.stripe_offset,
-            stripe_reference=args.stripe_reference,
-            object_distance_mm=args.object_distance_mm,
-            show=args.show,
-        )
+        process_image(image_path, show=args.show, **shared)
 
 
 if __name__ == "__main__":

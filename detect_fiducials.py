@@ -69,29 +69,67 @@ NOMINAL_RING_RATIO = OUTER_RADIUS_MM / INNER_RADIUS_MM
 # significance floor allowed there because the position is strongly constrained.
 DEFAULT_GUIDED_SEARCH_PX = 35
 DEFAULT_GUIDED_MIN_SNR = 1.5
+# Fractional band around the expected outer radius that the search will accept. The
+# ratio is known to ~1%, so a tight band is justified and necessary: at 0.15 the
+# 35 cm batch accepted wrong 4-mark quads and measured the ratio to only +-0.067,
+# against +-0.008 at 0.04.
+DEFAULT_RING_RATIO_TOLERANCE = 0.05
+# Mark size scales with magnification, so the template must too. DEFAULT_ARM_LENGTH
+# is right when the inner ring measures this many px (the 45 cm batch); the outer
+# search rescales the template by r_inner / this. Without it the 35 cm batch (marks
+# 1.29x larger) measured the ring ratio to only +-0.15 instead of +-0.004.
+REFERENCE_INNER_RADIUS_PX = 114.7
+# Which channel the profile is measured from. "mean" averages R,G,B; the named
+# channels take one plane. CHANNELS[i] for i>=1 maps to RGB plane i-1.
+CHANNELS = ("mean", "red", "green", "blue")
+DEFAULT_CHANNEL = "green"
 
 
 # --------------------------------------------------------------------------- I/O
 
 
-def load_image(path: Path) -> np.ndarray:
-    """Load a DNG file and return a grayscale image array."""
+def load_image(path: Path, channel: str = DEFAULT_CHANNEL) -> np.ndarray:
+    """Load a DNG file as a single channel, linear in sensor counts.
+
+    No white balance and no gamma: ``user_wb`` is unity and ``gamma`` is 1, so values
+    stay proportional to what the sensor collected. Both are removed deliberately,
+    because both corrupted the photometry:
+
+    * Camera white balance multiplies R by 1.84 and B by 1.73 (G by exactly 1.00).
+      After demosaic that pushes R and B past the 16-bit ceiling, hard-clipping them
+      over 72-95% of the measurement region on these frames while leaving G clean.
+    * rawpy applies sRGB gamma by default, which is non-linear and flattens
+      highlights.
+
+    Together they understated the measured falloff depth by ~70%. Loading this way,
+    all three channels are equivalent and clip only where the *sensor* itself is
+    saturated -- which is then visible rather than hidden.
+
+    Green is the default channel: a Bayer sensor has twice as many green sites as red
+    or blue, so it is the least interpolated.
+    """
+    if channel not in CHANNELS:
+        raise ValueError(f"channel must be one of {CHANNELS}, got {channel!r}")
+
     raw = rawpy.imread(str(path))
     try:
         rgb = raw.postprocess(
-            output_color=rawpy.ColorSpace.sRGB,
+            output_color=rawpy.ColorSpace.raw,
             no_auto_bright=True,
             output_bps=16,
-            use_camera_wb=True,
+            user_wb=[1.0, 1.0, 1.0, 1.0],
+            gamma=(1, 1),
         )
     except TypeError:
         rgb = raw.postprocess()
     raw.close()
 
     image = np.asarray(rgb, dtype=np.float64)
-    if image.ndim == 3:
+    if image.ndim != 3:
+        return image
+    if channel == "mean":
         return image.mean(axis=2)
-    return image
+    return image[:, :, CHANNELS.index(channel) - 1]
 
 
 def discover_images(input_path: Path, pattern: Optional[str] = None) -> List[Path]:
@@ -391,6 +429,8 @@ class Detection:
         self.mm_per_px = float("nan")
         self.ring_ratio_used = float("nan")
         self.ring_ratio_measured = float("nan")
+        # Which channel the measurement came from.
+        self.channel = DEFAULT_CHANNEL
 
     @property
     def found(self) -> bool:
@@ -432,6 +472,8 @@ def detect(
     inner_radius_mm: float = INNER_RADIUS_MM,
     outer_radius_mm: float = OUTER_RADIUS_MM,
     ring_ratio: Optional[float] = None,
+    ring_ratio_tolerance: float = DEFAULT_RING_RATIO_TOLERANCE,
+    auto_scale_template: bool = True,
     guided_search_px: int = DEFAULT_GUIDED_SEARCH_PX,
     guided_min_snr: float = DEFAULT_GUIDED_MIN_SNR,
 ) -> Detection:
@@ -467,6 +509,25 @@ def detect(
 
     inner = np.array([refine_subpixel(residual, p) for p in inner], dtype=np.float64)
     center = inner.mean(axis=0)
+
+    # Both rings are symmetric quads, so this search can lock onto the *outer* one --
+    # it happens on saturated frames where the bold inner marks lose contrast while
+    # the outer ones keep theirs. The ring ratio disambiguates: if a concentric quad
+    # sits at r/ratio, that smaller ring is the real inner one.
+    ratio_guess = float(ring_ratio) if ring_ratio else outer_radius_mm / inner_radius_mm
+    candidate_radius = float(np.linalg.norm(inner - center, axis=1).mean())
+    smaller = find_symmetric_quad(
+        points,
+        center,
+        min_radius=(1.0 - ring_ratio_tolerance) * candidate_radius / ratio_guess,
+        max_radius=(1.0 + ring_ratio_tolerance) * candidate_radius / ratio_guess,
+        radius_tolerance=0.10,
+        angle_tolerance_deg=12.0,
+    )
+    if smaller is not None:
+        inner = np.array([refine_subpixel(residual, p) for p in smaller], dtype=np.float64)
+        center = inner.mean(axis=0)
+
     result.inner_marks = sort_points_by_angle(inner, (float(center[0]), float(center[1])))
     result.center = (float(center[0]), float(center[1]))
     result.inner_circle = fit_circle(result.inner_marks)
@@ -474,18 +535,30 @@ def detect(
     # Physical scale straight off the fiducial: the inner ring is a known size.
     result.mm_per_px = float(inner_radius_mm / inner_radius) if inner_radius > 0 else float("nan")
 
+    # Rescale the template to the observed mark size before hunting the fainter
+    # outer marks. At the reference scale this is a no-op.
+    outer_response = response
+    scale = inner_radius / REFERENCE_INNER_RADIUS_PX
+    if auto_scale_template and abs(scale - 1.0) > 0.10:
+        scaled_arm = max(8, int(round(arm_length * scale)))
+        scaled_bar = max(3, int(round(bar_width * scale)))
+        outer_response = crossness_response(residual, arm_length=scaled_arm, bar_width=scaled_bar)
+        points, _ = find_peaks(outer_response, min_separation=2 * scaled_arm + 1)
+
     centre_tuple = (float(center[0]), float(center[1]))
     # The ratio is what the geometry needs, and it is distance-independent.
     radius_ratio = float(ring_ratio) if ring_ratio else outer_radius_mm / inner_radius_mm
     result.ring_ratio_used = radius_ratio
 
-    # First try the unconstrained search: it needs no prior and is what validates on
-    # frames where the outer ring is clean.
+    # Search only near where the known ring ratio says the outer marks must be. A
+    # wide band admits spurious wide quads: on the 35 cm batch it accepted symmetric
+    # noise sets at ratio 5.4 and 5.9, which this rejects outright.
+    expected_radius = inner_radius * radius_ratio
     outer = find_symmetric_quad(
         points,
         center,
-        min_radius=1.3 * inner_radius,
-        max_radius=8.0 * inner_radius,
+        min_radius=(1.0 - ring_ratio_tolerance) * expected_radius,
+        max_radius=(1.0 + ring_ratio_tolerance) * expected_radius,
     )
     if outer is not None:
         outer = np.array([refine_subpixel(residual, p) for p in outer], dtype=np.float64)
@@ -503,7 +576,7 @@ def detect(
     threshold = guided_min_snr * result.noise
     marks, measured = [], 0
     for target in predicted:
-        hit = search_mark_near(response, target, guided_search_px, threshold)
+        hit = search_mark_near(outer_response, target, guided_search_px, threshold)
         if hit is None:
             marks.append(target)  # fall back to the predicted position
         else:
@@ -527,9 +600,11 @@ def detect(
     return result
 
 
-def detect_file(image_path: Path, **kwargs) -> Detection:
+def detect_file(image_path: Path, channel: str = DEFAULT_CHANNEL, **kwargs) -> Detection:
     """Load a DNG and detect its fiducial marks."""
-    return detect(load_image(image_path), **kwargs)
+    result = detect(load_image(image_path, channel=channel), **kwargs)
+    result.channel = channel
+    return result
 
 
 # -------------------------------------------------------------------- reporting
@@ -556,6 +631,8 @@ def detection_to_dict(result: Detection, image_path: Path) -> Dict[str, object]:
         "outer_circle": circle_dict(result.outer_circle),
         "outer_ring_source": result.outer_source,
         "outer_marks_measured": result.outer_detected,
+        "channel": result.channel,
+        "load": "linear: unity white balance, gamma 1, no auto-bright",
         "mm_per_px": result.mm_per_px,
         "mm_per_px_note": "per-frame; depends on camera distance, not reusable across batches",
         "ring_ratio_used": result.ring_ratio_used,
@@ -591,6 +668,17 @@ def describe(result: Detection, name: str) -> str:
     )
 
 
+def add_loading_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register the image-loading flags, shared by every CLI."""
+    parser.add_argument(
+        "--channel",
+        choices=CHANNELS,
+        default=DEFAULT_CHANNEL,
+        help="Channel the profile is measured from. Green is the default: it is the only "
+             "channel the camera white balance leaves unscaled, so it never clips",
+    )
+
+
 def add_detection_arguments(parser: argparse.ArgumentParser) -> None:
     """Register the detection tuning flags, shared with process_images.py."""
     parser.add_argument("--arm-length", type=int, default=DEFAULT_ARM_LENGTH, help="Cross arm length in pixels")
@@ -612,6 +700,12 @@ def add_detection_arguments(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=INNER_RADIUS_MM,
         help="Physical radius of the inner fiducial ring in mm",
+    )
+    parser.add_argument(
+        "--ring-ratio-tolerance",
+        type=float,
+        default=DEFAULT_RING_RATIO_TOLERANCE,
+        help="Fractional band around the expected outer radius searched for the outer marks",
     )
     parser.add_argument(
         "--ring-ratio",
@@ -640,6 +734,7 @@ def main() -> None:
         help="Filename glob to filter a directory, e.g. '*cam_2*'",
     )
     parser.add_argument("--limit", type=int, default=None, help="Process at most N images from a directory")
+    add_loading_arguments(parser)
     add_detection_arguments(parser)
     args = parser.parse_args()
 
@@ -655,6 +750,7 @@ def main() -> None:
     for image_path in images:
         result = detect_file(
             image_path,
+            channel=args.channel,
             arm_length=args.arm_length,
             bar_width=args.bar_width,
             background_sigma=args.background_sigma,
@@ -662,6 +758,7 @@ def main() -> None:
             inner_radius_mm=args.inner_radius_mm,
             outer_radius_mm=args.outer_radius_mm,
             ring_ratio=args.ring_ratio,
+            ring_ratio_tolerance=args.ring_ratio_tolerance,
         )
         print(describe(result, image_path.name))
 
